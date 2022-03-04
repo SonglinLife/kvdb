@@ -542,7 +542,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else {
 		reply.Term = rf.currentTerm
 		reply.Success = false
-		reply.XTerm = -3
+		// reply.XTerm = -3
 	}
 }
 
@@ -573,14 +573,15 @@ func (rf *Raft) sendInstallsnapshot(server int, args *InstallsnapshotArgs, reply
 	}
 
 }
-
 func (rf *Raft) sendHeartBeat(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	ch := make(chan bool)
-	ctx, _ := context.WithTimeout(context.Background(), time.Millisecond*50)
+	ctx, _ := context.WithTimeout(context.Background(), time.Millisecond*30)
+
 	go func() {
 		// DPrintf("rf[%v] send entries %v",rf.me, args.Entries)
-		ch <- rf.peers[server].Call("Raft.AppendEntries", args, reply)
+			ch <- rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	}()
+
 	select {
 	case <-ctx.Done():
 		return
@@ -595,18 +596,20 @@ func (rf *Raft) sendHeartBeat(server int, args *AppendEntriesArgs, reply *Append
 			rf.currentTerm = reply.Term
 			rf.persist()
 			return
-		} else if rf.status != 2 || args.Term != reply.Term || reply.XTerm == -3 { // 不再是leader或者这个rpc不在任期内
+		} else if rf.status != 2 || args.Term != reply.Term || rf.currentTerm != reply.Term { // 不再是leader或者这个rpc不在任期内
+			// time.Sleep(10*time.Millisecond)
 			return
 		}
-
 		if reply.XTerm == -2 && reply.XIndex == len(args.Entries)+rf.nextIndex[server] {
 			rf.nextIndex[server] = reply.XIndex
 			rf.matchIndex[server] = reply.XIndex - 1
-		} else if reply.Success && reply.XIndex == len(args.Entries)+rf.nextIndex[server] {
+		} else if reply.Success {
 			// DPrintf("rf[%v] server %v nextIndex %v has append entries %v")
 			// DPrintf()
-			rf.nextIndex[server] = reply.XIndex
-			rf.matchIndex[server] = reply.XIndex - 1
+			if reply.XIndex == len(args.Entries)+rf.nextIndex[server] {
+				rf.nextIndex[server] = reply.XIndex
+				rf.matchIndex[server] = reply.XIndex - 1
+			}
 		} else { // 如果返回失败说明，log不匹配
 			rf.setNextIndex(server, args, reply)
 		}
@@ -617,7 +620,7 @@ func (rf *Raft) sendHeartBeat(server int, args *AppendEntriesArgs, reply *Append
 func (rf *Raft) setNextIndex(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	if reply.XTerm == -1 {
 		rf.nextIndex[server] = reply.XIndex
-	} else if reply.XTerm > 0 {
+	} else if reply.XTerm >= 0 {
 		hit := false
 		var i int
 		for i = len(rf.logs) - 1; i >= 1; i-- { // 0 是空log应该从1开始遍历
@@ -752,21 +755,18 @@ func (rf *Raft) heartsbeats() {
 					continue
 				}
 				entries := []Log{}
-				PrevLogIndex := rf.lastIncludedIndex
-				PreLogTerm := rf.lastIncludedTerm
-				if rf.nextIndex[server] > rf.lastIncludedIndex {
-					// var end = len(rf.logs)
-					// if len(rf.logs) - rf.Convert(rf.nextIndex[server]) > 100{
-						
-					// }
-					t := make([]Log, len(rf.logs[rf.Convert(rf.nextIndex[server]):len(rf.logs)]))
-					copy(t, rf.logs[rf.Convert(rf.nextIndex[server]):len(rf.logs)])
-					entries = t
-					PrevLogIndex = rf.nextIndex[server] - 1
-					PreLogTerm = rf.logs[rf.Convert(rf.nextIndex[server]-1)].TermNumber
-					// entries =  rf.logs[rf.nextIndex[server]:len(rf.logs)] // 一次性全打包出去
 
-				}
+				// var end = len(rf.logs)
+				// if len(rf.logs) - rf.Convert(rf.nextIndex[server]) > 100{
+
+				// }
+				t := make([]Log, len(rf.logs[rf.Convert(rf.nextIndex[server]):len(rf.logs)]))
+				copy(t, rf.logs[rf.Convert(rf.nextIndex[server]):len(rf.logs)])
+				entries = t
+				PrevLogIndex := rf.nextIndex[server] - 1
+				PreLogTerm := rf.logs[rf.Convert(rf.nextIndex[server])-1].TermNumber
+				// entries =  rf.logs[rf.nextIndex[server]:len(rf.logs)] // 一次性全打包出去
+
 				DPrintf("rf[%v] send %v to rf[%v] rf.nextIndex + len(entries) = %v len(rf.logs) %v lastIndex %v", rf.me, entries, server, rf.nextIndex[server]+len(entries), rf.Reconvert(len(rf.logs)), rf.lastIncludedIndex)
 				DPrintf("rf[%v] logs %v", rf.me, rf.logs)
 				args := AppendEntriesArgs{
@@ -778,7 +778,7 @@ func (rf *Raft) heartsbeats() {
 					LeaderCommit: rf.commitIndex,
 				}
 				i := rf.currentTerm
-				go rf.sendHeartBeat(server, &args, &AppendEntriesReply{Term: i, Success: false, XIndex: 0, XTerm: -3})
+				go rf.sendHeartBeat(server, &args, &AppendEntriesReply{Term: i, Success: false, XIndex: 0, XTerm: -110})
 
 			}
 		} else {
