@@ -22,6 +22,7 @@ import (
 
 	"bytes"
 	"context"
+	"fmt"
 	"math"
 	"math/rand"
 	"sync"
@@ -398,10 +399,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.XTerm = -1
 			reply.XIndex = rf.Reconvert(len(rf.logs))
 			reply.Success = false
-		} else if args.PrevLogIndex <= rf.lastIncludedIndex {
-			reply.XIndex = rf.Reconvert(1) // 之前的index我已经通过snapshot有了，请发送下一个
-			reply.XTerm = -1
-		} else if rf.logs[rf.Convert(args.PrevLogIndex)].TermNumber != args.PreLogTerm {
+		}else if rf.logs[rf.Convert(args.PrevLogIndex)].TermNumber != args.PreLogTerm {
 			reply.XTerm = rf.logs[rf.Convert(args.PrevLogIndex)].TermNumber
 			reply.XIndex = args.PrevLogIndex
 			for i := rf.Convert(args.PrevLogIndex); i >= 1; i-- { // 不应该遍历到0，因为0是空command
@@ -460,7 +458,7 @@ func (rf *Raft) sendInstallsnapshot(server int, args *InstallsnapshotArgs, reply
 		}
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
-		if rf.currentTerm < reply.Term {
+		if rf.currentTerm < reply.Term{
 			rf.currentTerm = reply.Term
 			rf.status = 0
 		}
@@ -627,46 +625,44 @@ func (rf *Raft) heartsbeats() {
 				min = k
 			}
 		}
+		if rf.Convert(min) == -1 {
+			fmt.Println(rf.lastIncludedIndex)
+			fmt.Println(len(rf.logs))
+		}
 		if min > rf.commitIndex && rf.logs[rf.Convert(min)].TermNumber == rf.currentTerm {
 			rf.commitIndex = min
 		}
 		status := rf.status
 		if status == 2 {
 			for server := range rf.peers {
-				entries := []Log{}
-				PrevLogIndex := rf.lastIncludedIndex
-				PreLogTerm := rf.lastIncludedTerm
-				if server == rf.me {
-					continue
-				}
-				if rf.nextIndex[server] > rf.lastIncludedIndex {
-					t := make([]Log, len(rf.logs[rf.Convert(rf.nextIndex[server]):len(rf.logs)]))
-					copy(t, rf.logs[rf.Convert(rf.nextIndex[server]):len(rf.logs)])
-					entries = t
-					PrevLogIndex = rf.nextIndex[server] - 1
-					PreLogTerm = rf.logs[rf.Convert(rf.nextIndex[server]-1)].TermNumber
-					// entries =  rf.logs[rf.nextIndex[server]:len(rf.logs)] // 一次性全打包出去
+				if server != rf.me {
+					entries := []Log{}
+					if rf.nextIndex[server] < len(rf.logs) {
+						t := make([]Log, len(rf.logs[rf.Convert(rf.nextIndex[server]):len(rf.logs)]))
+						copy(t, rf.logs[rf.Convert(rf.nextIndex[server]):len(rf.logs)])
+						entries = t
+						// entries =  rf.logs[rf.nextIndex[server]:len(rf.logs)] // 一次性全打包出去
 
+					}
+					DPrintf("rf[%v] send %v to rf[%v] rf.nextIndex + len(entries) = %v len(rf.logs) %v", rf.me, entries, server, rf.nextIndex[server]+len(entries), len(rf.logs))
+					args := AppendEntriesArgs{
+						Term:         rf.currentTerm,
+						LeaderId:     rf.me,
+						PrevLogIndex: rf.nextIndex[server] - 1,
+						PreLogTerm:   rf.logs[rf.Convert(rf.nextIndex[server]-1)].TermNumber,
+						Entries:      entries,
+						LeaderCommit: rf.commitIndex,
+					}
+					i := rf.currentTerm
+					go rf.sendHeartBeat(server, &args, &AppendEntriesReply{Term: i, Success: false, XIndex: 0, XTerm: 0})
 				}
-				// DPrintf("rf[%v] send %v to rf[%v] rf.nextIndex + len(entries) = %v len(rf.logs) %v", rf.me, entries, server, rf.nextIndex[server]+len(entries), len(rf.logs))
-				args := AppendEntriesArgs{
-					Term:         rf.currentTerm,
-					LeaderId:     rf.me,
-					PrevLogIndex: PrevLogIndex,
-					PreLogTerm:   PreLogTerm,
-					Entries:      entries,
-					LeaderCommit: rf.commitIndex,
-				}
-				i := rf.currentTerm
-				go rf.sendHeartBeat(server, &args, &AppendEntriesReply{Term: i, Success: false, XIndex: 0, XTerm: 0})
-
 			}
 		} else {
 			rf.mu.Unlock()
 			return
 		}
 		rf.mu.Unlock()
-		// DPrintf("rf[%v] is leader, currentTerm %v has log length %v, last log term is %v, commitIndex is %v, applyIndex is %v", rf.me, rf.currentTerm, (rf.logs), rf.logs[len(rf.logs)-1].TermNumber, rf.commitIndex, rf.lastApplied)
+		DPrintf("rf[%v] is leader, currentTerm %v has log length %v, last log term is %v, commitIndex is %v, applyIndex is %v", rf.me, rf.currentTerm, (rf.logs), rf.logs[len(rf.logs)-1].TermNumber, rf.commitIndex, rf.lastApplied)
 
 		time.Sleep(50 * time.Millisecond)
 	}
