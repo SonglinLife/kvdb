@@ -31,6 +31,7 @@ import (
 	//	"6.824/labgob"
 	"6.824/labgob"
 	"6.824/labrpc"
+	"sourcegraph.com/sqs/goreturns/returns"
 )
 
 //
@@ -126,6 +127,7 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
+	e.Encode(rf.logs)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.currentTerm)
 	data := w.Bytes()
@@ -140,6 +142,14 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+}
+func(rf *Raft) Convert(index int)int{
+	return index - rf.lastIncludedIndex -1
+
+}
+
+func(rf *Raft) Reconvert(index int)int{ // convert log index to index
+	return index + rf.lastIncludedIndex + 1
 }
 
 //
@@ -281,12 +291,21 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// reply.VoteGranted = true
 		// rf.startTime = time.Now() // 投票出去才会重置时间
 		// rf.persist()
-		if rf.logs[len(rf.logs)-1].TermNumber < args.LastLogTerm {
+		LastLogIndex := rf.Convert(len(rf.logs))
+		var LastLogTerm int
+		if len(rf.logs) == 0{
+			LastLogTerm = rf.lastIncludedTerm
+		}else{
+			LastLogTerm = rf.logs[len(rf.logs)-1].TermNumber
+		}
+
+		if LastLogTerm < args.LastLogTerm {
 			rf.votedFor = args.CandidateId
 			reply.VoteGranted = true
 			rf.startTime = time.Now() // 投票出去才会重置时间
 			rf.persist()
-		} else if rf.logs[len(rf.logs)-1].TermNumber == args.LastLogTerm && len(rf.logs)-1 <= args.LastLogIndex { // 这里的index用了等于
+
+		} else if LastLogTerm == args.LastLogTerm && LastLogIndex <= args.LastLogIndex { // 这里的index用了等于
 			rf.votedFor = args.CandidateId
 			reply.VoteGranted = true
 			rf.startTime = time.Now() // 投票出去才会重置时间
@@ -383,20 +402,26 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// t := rf.startTime
 		rf.startTime = time.Now()
 		// DPrintf("rf[%d] have new start time, since time %v", rf.me, time.Since(rf.startTime))
-		if args.PrevLogIndex >= len(rf.logs) { // 表明当前log还很短
+		if args.PrevLogIndex <= rf.lastIncludedIndex{ // 确保当前的prevLogIndex还在
+			reply.XIndex = rf.lastIncludedIndex + 1
 			reply.XTerm = -1
-			reply.XIndex = len(rf.logs)
+			return
+		}
+
+		if args.PrevLogIndex >= rf.Reconvert(len(rf.logs)) { // 表明当前log还很短
+			reply.XTerm = -1
+			reply.XIndex = rf.Reconvert(len(rf.logs))
 			reply.Success = false
-		} else if rf.logs[args.PrevLogIndex].TermNumber != args.PreLogTerm {
-			reply.XTerm = rf.logs[args.PrevLogIndex].TermNumber
-			for i := args.PrevLogIndex; i >= 0; i-- {
-				if rf.logs[i-1].TermNumber != rf.logs[i].TermNumber {
+		} else if rf.logs[rf.Convert(args.PrevLogIndex)].TermNumber != args.PreLogTerm { // 这里会出现out of range 情况吗？。。。。
+			reply.XTerm = rf.logs[rf.Convert(args.PrevLogIndex)].TermNumber
+			for i := rf.Convert(args.PrevLogIndex); i >= 0; i-- { 
+				if rf.logs[i].TermNumber != rf.logs[rf.Convert(args.PrevLogIndex)].TermNumber {
 					reply.XIndex = i
 					break
 				}
 			}
 		} else { // 成功hit！
-			last := rf.logs[args.PrevLogIndex+1 : len(rf.logs)]
+			last := rf.logs[rf.Convert(args.PrevLogIndex+1) : rf.Convert(len(rf.logs))]
 			DPrintf("rf[%v] want to append entries %v", rf.me, args.Entries)
 			// 有个难点如何判断旧的rpc
 			if len(last) == len(args.Entries) && len(last) != 0 {
@@ -411,19 +436,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				if flag {
 					// rf.commitIndex = int(math.Min(float64(len(rf.logs)), float64(args.LeaderCommit)))
 					reply.XTerm = -2 // 说明已经append过了
-					reply.XIndex = len(rf.logs)
+					reply.XIndex = rf.Reconvert( len(rf.logs))
 
 					// reply.Success = true
 					return
 				}
 			}
-			rf.logs = rf.logs[0 : args.PrevLogIndex+1]
+			rf.logs = rf.logs[0 : rf.Convert(args.PrevLogIndex+1)]
 			DPrintf("rf[%v] is follower, append entries %v", rf.me, args.Entries)
 			rf.logs = append(rf.logs, args.Entries...)
-			reply.XIndex = len(rf.logs)
+			reply.XIndex = rf.Reconvert(len(rf.logs))
 			rf.persist()
 			reply.Success = true
-			rf.commitIndex = int(math.Min(float64(len(rf.logs)), float64(args.LeaderCommit)))
+			rf.commitIndex = int(math.Min(float64(rf.Reconvert(len(rf.logs))), float64(args.LeaderCommit)))
 		}
 	} else {
 		reply.Term = rf.currentTerm
@@ -453,6 +478,9 @@ func (rf *Raft) sendHeartBeat(server int, args *AppendEntriesArgs, reply *Append
 			return
 		} else if rf.status != 2 || rf.currentTerm != reply.Term{ // 不再是leader或者这个rpc不在任期内
 			return
+		}else if reply.XIndex <= rf.lastIncludedIndex{
+			go rf.Installsnapshot(server, nil, nil) // 安装snapshot
+			rf.nextIndex[server] = rf.lastIncludedIndex + 1
 		}else if reply.XTerm == -2 && reply.XIndex == len(args.Entries)+rf.nextIndex[server] {
 			rf.nextIndex[server] = reply.XIndex
 			rf.matchIndex[server] = reply.XIndex - 1
@@ -476,7 +504,7 @@ func (rf *Raft) setNextIndex(server int, args *AppendEntriesArgs, reply *AppendE
 	} else {
 		hit := false
 		var i int
-		for i = len(rf.logs) - 1; i >= 1; i-- {
+		for i = len(rf.logs) - 1; i >= 0; i-- { // 这里为了snapshot 测试修改了i>=0
 			if rf.logs[i].TermNumber == reply.XTerm {
 				hit = true
 				break
@@ -485,13 +513,32 @@ func (rf *Raft) setNextIndex(server int, args *AppendEntriesArgs, reply *AppendE
 			}
 		}
 		if hit {
-			rf.nextIndex[server] = i
+			rf.nextIndex[server] = rf.Reconvert(i)
 		} else {
 			rf.nextIndex[server] = reply.XIndex
 		}
 	}
-	if rf.nextIndex[server] >= len(rf.logs)+1 {
-		DPrintf("rf[%v] replyterm %v replyindex %v argsentries %v", rf.me, reply.XTerm, reply.XIndex, args.Entries)
+}
+
+func(rf *Raft)SendSnapShot(server int, args *InstallsnapshotArgs, reply *InstallsnapshotReply){
+	ch := make(chan bool)
+	go func(){
+		ch <- rf.peers[server].Call("Raft.Installsnapshot", args, reply)
+	}()
+	c, _:= context.WithTimeout(context.Background(), 80 *time.Millisecond)
+	select{
+	case <- c.Done():
+		return
+	case t := <-ch:
+		if !t{
+			return
+		}
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		if rf.currentTerm < reply.Term{
+			rf.currentTerm = reply.Term
+			rf.status = 0
+		}
 	}
 }
 
@@ -518,7 +565,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) { // 这个函数用
 	defer rf.mu.Unlock()
 	if rf.status == 2 && rf.dead != 1 {
 		isLeader = true
-		index = len(rf.logs)
+		index = rf.Convert(len(rf.logs))
 		DPrintf("rf[%v] write command %v to log index %v", rf.me, command, index)
 		rf.logs = append(rf.logs, Log{rf.currentTerm, command})
 		rf.persist()
@@ -589,33 +636,43 @@ func (rf *Raft) heartsbeats() {
 				min = k
 			}
 		}
-		if min > rf.commitIndex && rf.logs[min].TermNumber == rf.currentTerm {
+		if min > rf.commitIndex && rf.logs[rf.Convert(min)].TermNumber == rf.currentTerm {
 			rf.commitIndex = min
 		}
 		status := rf.status
 		if status == 2 {
 			for server := range rf.peers {
-				if server != rf.me {
-					entries := []Log{}
-					if rf.nextIndex[server] < len(rf.logs) {
-						t := make([]Log, len(rf.logs[rf.nextIndex[server]:len(rf.logs)]))
-						copy(t, rf.logs[rf.nextIndex[server]:len(rf.logs)])
-						entries = t
-						// entries =  rf.logs[rf.nextIndex[server]:len(rf.logs)] // 一次性全打包出去
-
-					}
-					DPrintf("rf[%v] send %v to rf[%v] rf.nextIndex + len(entries) = %v len(rf.logs) %v", rf.me, entries, server, rf.nextIndex[server]+len(entries), len(rf.logs))
-					args := AppendEntriesArgs{
-						Term:         rf.currentTerm,
-						LeaderId:     rf.me,
-						PrevLogIndex: rf.nextIndex[server] - 1,
-						PreLogTerm:   rf.logs[rf.nextIndex[server]-1].TermNumber,
-						Entries:      entries,
-						LeaderCommit: rf.commitIndex,
-					}
-					i := rf.currentTerm
-					go rf.sendHeartBeat(server, &args, &AppendEntriesReply{Term: i, Success: false, XIndex: 0, XTerm: 0})
+				if server == rf.me{
+					continue
 				}
+
+				entries := []Log{}
+				if rf.nextIndex[server] <= rf.lastIncludedIndex{
+					// go rf.Installsnapshot(server, nil, nil)
+					rf.nextIndex[server] = rf.lastIncludedIndex + 1
+					continue
+				}
+				if rf.Convert(rf.nextIndex[server]) < len(rf.logs) {
+					t := make([]Log, len(rf.logs[rf.Convert(rf.nextIndex[server]):len(rf.logs)]))
+					copy(t, rf.logs[rf.Convert(rf.nextIndex[server]):len(rf.logs)])
+					entries = t
+					// entries =  rf.logs[rf.nextIndex[server]:len(rf.logs)] // 一次性全打包出去
+
+				}
+				// DPrintf("rf[%v] send %v to rf[%v] rf.nextIndex + len(entries) = %v len(rf.logs) %v", rf.me, entries, server, rf.nextIndex[server]+len(entries), len(rf.logs))
+
+
+				args := AppendEntriesArgs{
+					Term:         rf.currentTerm,
+					LeaderId:     rf.me,
+					PrevLogIndex: rf.nextIndex[server] - 1,
+					PreLogTerm:   rf.logs[rf.Convert(rf.nextIndex[server]-1)].TermNumber,
+					Entries:      entries,
+					LeaderCommit: rf.commitIndex,
+				}
+				i := rf.currentTerm
+				go rf.sendHeartBeat(server, &args, &AppendEntriesReply{Term: i, Success: false, XIndex: 0, XTerm: 0})
+				
 			}
 		} else {
 			rf.mu.Unlock()
@@ -649,7 +706,7 @@ func (rf *Raft) AttempElection() {
 			continue
 		}
 		go func(server int) {
-			rva := RequestVoteArgs{Term: currentTerm, CandidateId: rf.me, LastLogIndex: len(rf.logs) - 1, LastLogTerm: rf.logs[len(rf.logs)-1].TermNumber}
+			rva := RequestVoteArgs{Term: currentTerm, CandidateId: rf.me, LastLogIndex: rf.Reconvert(len(rf.logs)) - 1, LastLogTerm: rf.logs[len(rf.logs)-1].TermNumber}
 			rvr := RequestVoteReply{Term: currentTerm, VoteGranted: false, HasRequest: false}
 			c, cancel := context.WithTimeout(context.Background(), time.Millisecond*50) // 争取在规定时间内完成投票
 			defer cancel()
@@ -688,7 +745,7 @@ func (rf *Raft) AttempElection() {
 		rf.status = 2
 		rf.nextIndex = make([]int, len(rf.peers))
 		for i := 0; i < len(rf.nextIndex); i++ {
-			rf.nextIndex[i] = len(rf.logs)
+			rf.nextIndex[i] = rf.Reconvert(len(rf.logs))
 		}
 		rf.matchIndex = make([]int, len(rf.peers)) // 这里初始化了 leader的nextIndex和matchIndex
 		// rf.logs = append(rf.logs, Log{rf.currentTerm, true}) // no-hup
@@ -730,7 +787,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.startTime = time.Now()
 	rand.Seed(time.Now().Unix())
 	// 这里初始化2b的log
-	rf.logs = make([]Log, 1)
+	rf.logs = make([]Log, 0)
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 
@@ -752,7 +809,7 @@ func (rf *Raft) Apply(applyCh chan ApplyMsg) {
 		ApplyMsgs := []ApplyMsg{}
 		if rf.lastApplied < rf.commitIndex {
 			for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-				entry := rf.logs[i]
+				entry := rf.logs[rf.Convert(i)]
 				msg := ApplyMsg{CommandValid: true, Command: entry.Command, CommandIndex: i}
 				ApplyMsgs = append(ApplyMsgs, msg)
 			}
