@@ -284,6 +284,7 @@ func (rf *Raft) Installsnapshot(args *InstallsnapshotArgs, reply *Installsnapsho
 		rf.status = 0
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
+		rf.leaderId = -1
 		rf.persist()
 	} else {
 		rf.startTime = time.Now()
@@ -372,6 +373,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// rf.startTime = time.Now()
 		rf.votedFor = -1
 		rf.persist()
+		rf.leaderId = -1
 	}
 	reply.Term = rf.currentTerm
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId { // rf.votedFor == args.CandidateId是因为可能crash，crash恢复之后还投回原来的candidate
@@ -390,12 +392,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.votedFor = args.CandidateId
 			reply.VoteGranted = true
 			rf.startTime = time.Now() // 投票出去才会重置时间
+			rf.leaderId = -1
 			rf.persist()
 
 		} else if rf.logs[len(rf.logs)-1].TermNumber == args.LastLogTerm && rf.Reconvert(len(rf.logs)-1) <= args.LastLogIndex { // 这里的index用了等于
 			rf.votedFor = args.CandidateId
 			reply.VoteGranted = true
 			rf.startTime = time.Now() // 投票出去才会重置时间
+			rf.leaderId = -1
 			rf.persist()
 		}
 	}
@@ -482,6 +486,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		DPrintf("rf[%v] is follower, currentTerm %v has log length %v, last log term is %v, commitIndex is %v, applyIndex is %v", rf.me, rf.currentTerm, rf.Reconvert(len(rf.logs)), rf.logs[len(rf.logs)-1].TermNumber, rf.commitIndex, rf.lastApplied)
 		if rf.currentTerm < args.Term { // term 提升
 			rf.votedFor = -1 // 这一轮没有投票，所以是-1
+			rf.leaderId = args.LeaderId
 			rf.currentTerm = args.Term
 			rf.persist()
 		}
@@ -565,6 +570,7 @@ func (rf *Raft) sendInstallsnapshot(server int, args *InstallsnapshotArgs, reply
 			rf.currentTerm = reply.Term
 			rf.status = 0
 			rf.votedFor = -1
+			rf.leaderId = -1
 			rf.persist()
 			return
 		}
@@ -579,7 +585,7 @@ func (rf *Raft) sendHeartBeat(server int, args *AppendEntriesArgs, reply *Append
 
 	go func() {
 		// DPrintf("rf[%v] send entries %v",rf.me, args.Entries)
-			ch <- rf.peers[server].Call("Raft.AppendEntries", args, reply)
+		ch <- rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	}()
 
 	select {
@@ -594,6 +600,7 @@ func (rf *Raft) sendHeartBeat(server int, args *AppendEntriesArgs, reply *Append
 		if rf.currentTerm < reply.Term {
 			rf.status = 0
 			rf.currentTerm = reply.Term
+			rf.leaderId = -1
 			rf.persist()
 			return
 		} else if rf.status != 2 || args.Term != reply.Term || rf.currentTerm != reply.Term { // 不再是leader或者这个rpc不在任期内
@@ -788,7 +795,7 @@ func (rf *Raft) heartsbeats() {
 		rf.mu.Unlock()
 		DPrintf("rf[%v] is leader, currentTerm %v has log length %v, last log term is %v, commitIndex is %v, applyIndex is %v", rf.me, rf.currentTerm, rf.Reconvert(len(rf.logs)), rf.logs[len(rf.logs)-1].TermNumber, rf.commitIndex, rf.lastApplied)
 
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -802,6 +809,7 @@ func (rf *Raft) AttempElection() {
 	term := currentTerm
 	sum := 1
 	rf.votedFor = rf.me
+	rf.leaderId = -1
 	rf.electionTimeout = randomizeTimeout()
 	// d := rf.electionTimeout
 	rf.startTime = time.Now()
@@ -848,19 +856,22 @@ func (rf *Raft) AttempElection() {
 	// DPrintf("rf[%v]: count:%v sum %v status:%v term:%v currentTerm:%v rf.currentTerm%v lastIndex %v lastApply %v commitIndex %v", rf.me, count, sum, rf.status, term, currentTerm, rf.currentTerm, rf.logs[len(rf.logs)-1].TermNumber, rf.lastApplied, rf.commitIndex)
 
 	if count >= half && rf.status == 1 && term == rf.currentTerm && term == currentTerm { // 保证还在选举期间
-
 		rf.status = 2
 		rf.nextIndex = make([]int, len(rf.peers))
 		for i := 0; i < len(rf.nextIndex); i++ {
 			rf.nextIndex[i] = rf.Reconvert(len(rf.logs))
 		}
 		rf.matchIndex = make([]int, len(rf.peers)) // 这里初始化了 leader的nextIndex和matchIndex
+		rf.leaderId = rf.me
 		// rf.logs = append(rf.logs, Log{rf.currentTerm, true}) // no-hup
 		go rf.heartsbeats()
 		DPrintf("%v become leader at term[%v]", rf.me, rf.currentTerm)
 	}
 	if term > rf.currentTerm {
 		rf.currentTerm = term
+		rf.leaderId = -1
+		rf.votedFor = -1
+		rf.status = 0
 		rf.persist()
 	}
 	cond.L.Unlock()
@@ -901,6 +912,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastIncludedIndex = 0
 	rf.lastIncludedTerm = 0
 	rf.applyCh = applyCh
+
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	rf.readSnap(persister.ReadSnapshot())
@@ -933,11 +945,25 @@ func (rf *Raft) Apply(applyCh chan ApplyMsg) {
 			rf.lastApplied++
 			rf.mu.Unlock()
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(14 * time.Millisecond)
 	}
 }
 
 func randomizeTimeout() time.Duration {
 	rand.Seed(time.Now().UnixMicro())
-	return time.Millisecond * time.Duration(rand.Intn(300)+200)
+	return time.Millisecond * time.Duration(rand.Intn(200)+200)
+}
+func (rf *Raft) LeaderId()int{
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.leaderId
+}
+
+func (rf *Raft)IsLeader()bool{
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.status == 2{
+		return true
+	}
+	return false
 }
