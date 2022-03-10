@@ -739,7 +739,7 @@ func (rf *Raft) heartsbeats() {
 			}
 		}
 		sort.Ints(tmp)
-		min := tmp[len(rf.peers)/2]
+		min := tmp[(len(rf.peers)-1)/2]
 		if min > rf.commitIndex && rf.logs[rf.Convert(min)].TermNumber == rf.currentTerm {
 			rf.commitIndex = min
 		}
@@ -822,14 +822,13 @@ func (rf *Raft) AttempElection() {
 		}
 		go func(server int) {
 			rva := RequestVoteArgs{Term: currentTerm, CandidateId: rf.me, LastLogIndex: rf.Reconvert(len(rf.logs)) - 1, LastLogTerm: rf.logs[len(rf.logs)-1].TermNumber}
-			rvr := RequestVoteReply{Term: currentTerm, VoteGranted: false, HasRequest: false}
+			rvr := RequestVoteReply{Term: 0, VoteGranted: false, HasRequest: false}
 			c, cancel := context.WithTimeout(context.Background(), time.Millisecond*50) // 争取在规定时间内完成投票
 			defer cancel()
 			t := rf.sendRequestVote(server, &rva, &rvr, c)
 			cond.L.Lock()
 			defer cond.L.Unlock()
 			sum++
-			cond.Broadcast()
 			if t == 0 || t == 1 {
 				return // 没来得及响应
 			}
@@ -839,13 +838,14 @@ func (rf *Raft) AttempElection() {
 			if rvr.VoteGranted {
 				count++
 			}
+			cond.Broadcast()
 
 		}(server)
 	}
 
-	half := int(math.Ceil(float64(len(rf.peers)) / 2))
+	half := len(rf.peers) /2 +1
 	cond.L.Lock()
-	for currentTerm == term && sum != len(rf.peers) && count <= half {
+	for currentTerm == term && sum != len(rf.peers) && count < half {
 		// DPrintf("%v %v %v", term, sum, count)
 		cond.Wait()
 	}
