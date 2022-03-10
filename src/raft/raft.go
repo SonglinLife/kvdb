@@ -24,6 +24,7 @@ import (
 	"context"
 	"math"
 	"math/rand"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -48,6 +49,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm  int
 
 	// For 2D:
 	SnapshotValid bool
@@ -483,7 +485,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	DPrintf("rf[%v] is follower logs %v", rf.me, rf.logs)
 	if rf.currentTerm <= args.Term {
 		// DPrintf("rf[%v] return follower , term %v arg.Term %v", rf.me, rf.currentTerm, args.Term)
-		DPrintf("rf[%v] is follower, currentTerm %v has log length %v, last log term is %v, commitIndex is %v, applyIndex is %v", rf.me, rf.currentTerm, rf.Reconvert(len(rf.logs)), rf.logs[len(rf.logs)-1].TermNumber, rf.commitIndex, rf.lastApplied)
+		// DPrintf("rf[%v] is follower, currentTerm %v has log length %v, last log term is %v, commitIndex is %v, applyIndex is %v", rf.me, rf.currentTerm, rf.Reconvert(len(rf.logs)), rf.logs[len(rf.logs)-1].TermNumber, rf.commitIndex, rf.lastApplied)
 		if rf.currentTerm < args.Term { // term 提升
 			rf.votedFor = -1 // 这一轮没有投票，所以是-1
 			rf.leaderId = args.LeaderId
@@ -496,7 +498,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// t := rf.startTime
 		rf.startTime = time.Now()
 		// DPrintf("rf[%d] have new start time, since time %v", rf.me, time.Since(rf.startTime))
-		if args.PrevLogIndex < rf.lastIncludedIndex {
+		if args.PrevLogIndex < rf.lastIncludedIndex { 
 			reply.Term = -1
 			reply.XIndex = rf.Reconvert(1)
 			return
@@ -510,7 +512,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.XIndex = rf.Reconvert(1)
 			for i := rf.Convert(args.PrevLogIndex); i >= 1; i-- { // 不应该遍历到0，因为0是空command
 				if rf.logs[i].TermNumber != rf.logs[rf.Convert(args.PrevLogIndex)].TermNumber {
-					reply.XIndex = rf.Reconvert(i)
+					reply.XIndex = rf.Reconvert(i+1)
 					break
 				}
 			}
@@ -728,18 +730,16 @@ func (rf *Raft) ticker() {
 func (rf *Raft) heartsbeats() {
 	for !rf.killed() {
 		rf.mu.Lock()
-		mpp := map[int]int{}
-		min := 0
-		for server, v := range rf.matchIndex {
-			if server != rf.me {
-				mpp[v]++
+		tmp := []int{}
+		// mpp := map[int]int{}
+		tmp = append(tmp, rf.Reconvert(len(rf.logs)-1))
+		for k,v := range rf.matchIndex{
+			if rf.me != k{
+				tmp = append(tmp, v)
 			}
 		}
-		for k, v := range mpp {
-			if v >= len(rf.peers)/2 && k > min {
-				min = k
-			}
-		}
+		sort.Ints(tmp)
+		min := tmp[len(rf.peers)/2]
 		if min > rf.commitIndex && rf.logs[rf.Convert(min)].TermNumber == rf.currentTerm {
 			rf.commitIndex = min
 		}
@@ -784,8 +784,8 @@ func (rf *Raft) heartsbeats() {
 					Entries:      entries,
 					LeaderCommit: rf.commitIndex,
 				}
-				i := rf.currentTerm
-				go rf.sendHeartBeat(server, &args, &AppendEntriesReply{Term: i, Success: false, XIndex: 0, XTerm: -110})
+				// i := rf.currentTerm
+				go rf.sendHeartBeat(server, &args, &AppendEntriesReply{Term: 0, Success: false, XIndex: 0, XTerm: 0})
 
 			}
 		} else {
@@ -930,7 +930,7 @@ func (rf *Raft) Apply(applyCh chan ApplyMsg) {
 		if rf.lastApplied < rf.commitIndex {
 			for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 				entry := rf.logs[rf.Convert(i)]
-				msg := ApplyMsg{CommandValid: true, Command: entry.Command, CommandIndex: i}
+				msg := ApplyMsg{CommandValid: true, Command: entry.Command, CommandIndex: i, CommandTerm: entry.TermNumber}
 				ApplyMsgs = append(ApplyMsgs, msg)
 			}
 			// rf.lastApplied = rf.commitIndex
@@ -945,7 +945,7 @@ func (rf *Raft) Apply(applyCh chan ApplyMsg) {
 			rf.lastApplied++
 			rf.mu.Unlock()
 		}
-		time.Sleep(14 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -953,17 +953,8 @@ func randomizeTimeout() time.Duration {
 	rand.Seed(time.Now().UnixMicro())
 	return time.Millisecond * time.Duration(rand.Intn(200)+200)
 }
-func (rf *Raft) LeaderId()int{
+func (rf *Raft) LeaderId() int {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	return rf.leaderId
-}
-
-func (rf *Raft)IsLeader()bool{
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if rf.status == 2{
-		return true
-	}
-	return false
 }

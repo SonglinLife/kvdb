@@ -16,8 +16,8 @@ type Clerk struct {
 	uuid              int64
 	lastExe           int
 	mu                sync.Mutex
-	serverMap         map[int]int
-	serverIndexAddMap map[int]int
+	// serverMap         map[int]int
+	// serverIndexAddMap map[int]int
 	// You will have to modify this struct.
 }
 
@@ -36,22 +36,27 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck.contactServer = 0
 	ck.uuid = nrand() // 给每一个客户端一个唯一的uuid
 	ck.lastExe = 0
-	ck.serverMap = map[int]int{}
-	ck.serverIndexAddMap = map[int]int{}
+	// ck.serverMap = map[int]int{}
+	// ck.serverIndexAddMap = map[int]int{}
 	return ck
 }
 
-func (ck *Clerk) FindLeader(reply *ClientRequestReply, index int) (int, int) {
+func (ck *Clerk) FindLeader(contactServer int) int {
+	// ck.mu.Lock()
+	// defer ck.mu.Unlock()
+	// i := reply.LeaderHint
+	// if i == -1 || ck.serverMap[i] == 0 { // server不知道谁是leader，或者client不知道leader address
+	// 	ck.contactServer = (index + 1) % len(ck.servers)
+	// } else {
+	// 	ck.contactServer = ck.serverMap[i] - 1
+	// }
+	// // DPrintf("client[%v] now request to kv[%v]", ck.uuid, ck.contactServer)
+	// return ck.contactServer, ck.serverIndexAddMap[ck.contactServer] - 1
 	ck.mu.Lock()
-	defer ck.mu.Unlock()
-	i := reply.LeaderHint
-	if i == -1 || ck.serverMap[i] == 0 { // server不知道谁是leader，或者client不知道leader address
-		ck.contactServer = (index + 1) % len(ck.servers)
-	} else {
-		ck.contactServer = ck.serverMap[i] - 1
-	}
-	// DPrintf("client[%v] now request to kv[%v]", ck.uuid, ck.contactServer)
-	return ck.contactServer, ck.serverIndexAddMap[ck.contactServer] - 1
+	ck.contactServer  = (ck.contactServer + 1) % len(ck.servers)
+	contactServer = ck.contactServer
+	ck.mu.Unlock()
+	return contactServer
 }
 
 // fetch the current value for a key.
@@ -78,40 +83,22 @@ func (ck *Clerk) FindLeader(reply *ClientRequestReply, index int) (int, int) {
 
 func (ck *Clerk) Request(args *ClientRequestArgs, Reply *ClientRequestReply) {
 	// You will have to modify this function.
-	contactServer, address := ck.GetContactServer()
+	contactServer := ck.contactServer
 	for {
 		reply := new(ClientRequestReply)
 		*reply = *Reply
-		ctx, _ := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		ctx, _ := context.WithTimeout(context.Background(),160*time.Millisecond)
 		ch := make(chan bool)
-		go func(contact, add int) {
+		go func(contact int) {
 			DPrintf("client[%v] send request to kv index %v", ck.uuid, contact)
 			ch <- ck.servers[contact].Call("KVServer.ClientRequest", args, reply)
-		}(contactServer, address)
+		}(contactServer)
 		select {
 		case <-ctx.Done():
-			ck.mu.Lock()
-			ck.contactServer = (ck.contactServer + 1) % len(ck.servers)
-			contactServer = ck.contactServer
-			address = ck.serverIndexAddMap[contactServer] - 1
-			ck.mu.Unlock()
+			contactServer = ck.FindLeader(contactServer)
 		case t := <-ch:
-			ck.mu.Lock()
-			// DPrintf("set map serveradd %v", reply.ServerId)
-			if reply.ServerId != -1 && ck.serverIndexAddMap[reply.ServerId] == 0 { // 如果得到了server的add
-				ck.serverMap[reply.ServerId] = contactServer + 1
-				ck.serverIndexAddMap[contactServer] = reply.ServerId + 1
-				// DPrintf("ck[%v] serverIndexmap %v, serverMap %v", ck.uuid, ck.serverIndexAddMap, ck.serverMap)
-			}
-			ck.mu.Unlock()
-
 			if !t || reply.Status == 0 {
-				// contactServer, address = ck.FindLeader(reply, contactServer)
-				ck.mu.Lock()
-				ck.contactServer  = (ck.contactServer + 1) % len(ck.servers)
-				contactServer = ck.contactServer
-				address = ck.serverIndexAddMap[contactServer] - 1
-				ck.mu.Unlock()
+				contactServer = ck.FindLeader(contactServer)
 			} else {
 				DPrintf("ck[%v] command %v ok", ck.uuid, args.SequenceNum)
 				*Reply = *reply
@@ -167,8 +154,3 @@ func (ck *Clerk) GetReply() ClientRequestReply {
 	}
 }
 
-func (ck *Clerk) GetContactServer() (int, int) {
-	ck.mu.Lock()
-	defer ck.mu.Unlock()
-	return ck.contactServer, ck.serverIndexAddMap[ck.contactServer] - 1
-}
