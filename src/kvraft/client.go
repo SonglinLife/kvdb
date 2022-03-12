@@ -1,21 +1,18 @@
 package kvraft
 
 import (
-	"context"
 	"crypto/rand"
 	"math/big"
-	"sync"
-	"time"
 
 	"6.824/labrpc"
 )
 
 type Clerk struct {
-	servers           []*labrpc.ClientEnd
-	contactServer     int // 上一个leader
-	uuid              int64
-	lastExe           int
-	mu                sync.Mutex
+	servers       []*labrpc.ClientEnd
+	contactServer int // 上一个leader
+	uuid          int64
+	lastExe       int
+
 	// serverMap         map[int]int
 	// serverIndexAddMap map[int]int
 	// You will have to modify this struct.
@@ -41,116 +38,46 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	return ck
 }
 
-func (ck *Clerk) FindLeader(contactServer int) int {
-	// ck.mu.Lock()
-	// defer ck.mu.Unlock()
-	// i := reply.LeaderHint
-	// if i == -1 || ck.serverMap[i] == 0 { // server不知道谁是leader，或者client不知道leader address
-	// 	ck.contactServer = (index + 1) % len(ck.servers)
-	// } else {
-	// 	ck.contactServer = ck.serverMap[i] - 1
-	// }
-	// // DPrintf("client[%v] now request to kv[%v]", ck.uuid, ck.contactServer)
-	// return ck.contactServer, ck.serverIndexAddMap[ck.contactServer] - 1
-	ck.mu.Lock()
-	ck.contactServer  = (ck.contactServer + 1) % len(ck.servers)
-	contactServer = ck.contactServer
-	ck.mu.Unlock()
-	return contactServer
+func (ck *Clerk) changeLeader() int {
+	ck.contactServer = (ck.contactServer + 1) % len(ck.servers)
+	return ck.contactServer
 }
 
-// fetch the current value for a key.
-// returns "" if the key does not exist.
-// keeps trying forever in the face of all other errors.
-//
-// you can send an RPC with code like this:
-// ok := ck.servers[i].Call("KVServer.Get", &args, &reply)
-//
-// the types of args and reply (including whether they are pointers)
-// must match the declared types of the RPC handler function's
-// arguments. and reply must be passed as a pointer.
-//
-
-//
-// shared by Put and Append.
-//
-// you can send an RPC with code like this:
-// ok := ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
-//
-// the types of args and reply (including whether they are pointers)
-// must match the declared types of the RPC handler function's
-// arguments. and reply must be passed as a pointer.
-
-func (ck *Clerk) Request(args *ClientRequestArgs, Reply *ClientRequestReply) {
+func (ck *Clerk) sendRequest(args *ClientRequestArgs) string {
 	// You will have to modify this function.
-	contactServer := ck.contactServer
-	for {
-		reply := new(ClientRequestReply)
-		*reply = *Reply
-		ctx, _ := context.WithTimeout(context.Background(),160*time.Millisecond)
-		ch := make(chan bool)
-		go func(contact int) {
-			DPrintf("client[%v] send request to kv index %v", ck.uuid, contact)
-			ch <- ck.servers[contact].Call("KVServer.ClientRequest", args, reply)
-		}(contactServer)
-		select {
-		case <-ctx.Done():
-			contactServer = ck.FindLeader(contactServer)
-		case t := <-ch:
-			if !t || reply.Status == 0 {
-				contactServer = ck.FindLeader(contactServer)
-			} else {
-				DPrintf("ck[%v] command %v ok", ck.uuid, args.SequenceNum)
-				*Reply = *reply
-				return
-			}
-		}
+	server := ck.contactServer
+	reply := new(ClientRequestReply)
+	for !ck.servers[server].Call("KVServer.ClientRequest", args, reply) || reply.Err != OK {
+		reply = new(ClientRequestReply)
+		server = ck.changeLeader()
 	}
+	return reply.Response
 }
 
 func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
-	args := ck.GetArgs(key, "", 0)
-	reply := ck.GetReply()
-	ck.Request(&args, &reply)
-	return reply.Response
+	args := ck.GetArgs(key, "", GET)
+	reply := ck.sendRequest(args)
+	return reply
 }
 
 func (ck *Clerk) Put(key string, value string) {
-	args := ck.GetArgs(key, value, 1)
-	reply := ck.GetReply()
-	ck.Request(&args, &reply)
+	args := ck.GetArgs(key, value, PUT)
+	ck.sendRequest(args)
 }
 func (ck *Clerk) Append(key string, value string) {
-	args := ck.GetArgs(key, value, 2)
-	reply := ck.GetReply()
-	ck.Request(&args, &reply)
+	args := ck.GetArgs(key, value, APPEND)
+	ck.sendRequest(args)
 }
 
-func (ck *Clerk) GetArgs(key, value string, command int) ClientRequestArgs {
-	ck.mu.Lock()
-	defer ck.mu.Unlock()
+func (ck *Clerk) GetArgs(key, value string, OpType int) *ClientRequestArgs {
 	i := ck.lastExe + 1
 	ck.lastExe++
-	return ClientRequestArgs{
+	return &ClientRequestArgs{
 		ClientId:    ck.uuid,
 		SequenceNum: i,
-		Command:     command,
-		Value:       value,
+		OpType:      OpType,
 		Key:         key,
+		Value:       value,
 	}
 }
-
-func (ck *Clerk) GetReply() ClientRequestReply {
-	status := 0
-	res := ""
-	leader := 0
-	serverid := 0
-	return ClientRequestReply{
-		Status:     status,
-		Response:   res,
-		LeaderHint: leader,
-		ServerId:   serverid,
-	}
-}
-

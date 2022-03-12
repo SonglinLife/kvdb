@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -11,7 +12,7 @@ import (
 	"6.824/raft"
 )
 
-const Debug = true
+const Debug = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -28,66 +29,59 @@ type Op struct {
 	Seq      int
 	Key      string
 	Value    string
-	Command  int
+	OpType   int
 }
 
 type KVServer struct {
-	mu           sync.Mutex
+	mu           sync.RWMutex
 	me           int
 	rf           *raft.Raft
 	applyCh      chan raft.ApplyMsg
 	dead         int32 // set by Kill()
 	data         map[string]string
-	done         map[int64]lastOp
-	notify       map[int] chan not
+	done         map[int64]int
+	notify       map[int64]chan string
 	maxraftstate int // snapshot if log grows this big
-	lastApply    int
+	lastApplied  int
 	Term         int
 	// chanMap map[int64](chan)
 	// Your definitions here.
 }
-type lastOp struct {
-	k        int
-	Response string
-}
-type not struct{
-	res string
-	term int
-}
 
 func (kv *KVServer) Dup(clientId int64, CommandId int) bool {
-	return kv.done[clientId].k >= CommandId
+	return kv.done[clientId] >= CommandId
 }
 
-func (kv *KVServer) getChan(index int) (chan not, bool) {
+func (kv *KVServer) makeChan(index, term int) chan string {
+	i := int64(index)*100000 + int64(term)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	ch := make(chan not)
-	kv.notify[index] = ch
-	return ch, false
+	ch := make(chan string)
+	kv.notify[i] = ch
+	return ch
+}
+func (kv *KVServer) getChan(index, term int) (chan string, bool) {
+	i := int64(index)*100000 + int64(term)
+
+	ch, ok := kv.notify[i]
+	return ch, ok
 }
 
-func (kv *KVServer) removeChan(index int) {
+func (kv *KVServer) removeChan(index, term int) {
+	i := int64(index)*100000 + int64(term)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	delete(kv.notify, index)
+	delete(kv.notify, i)
 }
 
 func (kv *KVServer) ClientRequest(args *ClientRequestArgs, reply *ClientRequestReply) {
 	if kv.killed() {
 		return
 	}
-	DPrintf("kv[%v] get request from client[%v]", kv.me, args.ClientId)
-	_, isleader := kv.rf.GetState()
 	kv.mu.Lock()
-	DPrintf("kv[%v] get lock, look request key %v value %v command %v CommandId %v from client[%v]", kv.me, args.Key, args.Value, args.Command, args.SequenceNum, args.ClientId)
-	
-	if args.Command != 0 && kv.Dup(args.ClientId, args.SequenceNum) && isleader{
-		reply.Status = 1
+	if args.OpType != GET && kv.Dup(args.ClientId, args.SequenceNum) {
+		reply.Err = OK
 		reply.Response = ""
-		kv.mu.Unlock()
-		DPrintf("kv[%v] CommandId %v return key %v value %v to client[%v]", kv.me, args.SequenceNum, args.Key, reply.Response, args.ClientId)
-		return
 	}
 	kv.mu.Unlock()
 	op := Op{
@@ -95,93 +89,22 @@ func (kv *KVServer) ClientRequest(args *ClientRequestArgs, reply *ClientRequestR
 		Seq:      args.SequenceNum,
 		Key:      args.Key,
 		Value:    args.Value,
-		Command:  args.Command,
+		OpType:   args.OpType,
 	}
 	index, term, isLeader := kv.rf.Start(op)
-
 	if !isLeader {
-		DPrintf("kv[%v] is not leader, should contact with kv[%v], reply %v", kv.me, reply.LeaderHint, reply.ServerId)
 		return
 	}
-	DPrintf("kv[%v] is leader, handle with request key %v value %v command %v CommandId %v from client[%v]", kv.me, args.Key, args.Value, args.Command, args.SequenceNum, args.ClientId)
-	ch, _ := kv.getChan(index)
+	ch := kv.makeChan(index, term)
 	select {
 	case res := <-ch:
-		if res.term == term{
-			reply.Response = res.res
-			reply.Status = 1
-			DPrintf("kv[%v] CommandId %v return key %v value %v to client[%v]", kv.me, args.SequenceNum, args.Key, res.res, args.ClientId)
-		}	
-	case <-time.After(80 * time.Millisecond):
+		reply.Err = OK
+		reply.Response = res
+	case <-time.After(100 * time.Millisecond):
 	}
-	go kv.removeChan(index)
-
-	// Your code here.
-	// DPrintf("kv[%v] get request from client[%v]", kv.me, args.ClientId)
-	// reply.ServerId = -1
-	// if kv.killed() {
-	// 	return
-	// }
-	// reply.ServerId = kv.me
-	// kv.mu.Lock()
-	// if kv.done[args.ClientId].k == args.SequenceNum {
-	// 	DPrintf("kv[%v] is leader, handle with request key %v value %v command %v CommandId %v from client[%v]", kv.me, args.Key, args.Value, args.Command, args.SequenceNum, args.ClientId)
-	// 	reply.Response = kv.done[args.ClientId].Response
-	// 	kv.mu.Unlock()
-	// 	reply.LeaderHint = kv.me
-	// 	reply.Status = 1
-	// 	DPrintf("kv[%v] CommandId %v return key %v value %v to client[%v]", kv.me, args.SequenceNum, args.Key, reply.Response, args.ClientId)
-	// 	return
-	// }else if kv.done[args.ClientId].k > args.SequenceNum{
-	// 	kv.mu.Unlock()
-	// 	return
-	// }
-	// kv.mu.Unlock()
-	// op := Op{
-	// 	ClientId: args.ClientId,
-	// 	Seq:      args.SequenceNum,
-	// 	Key:      args.Key,
-	// 	Value:    args.Value,
-	// 	Command:  args.Command,
-	// }
-	// _, term, isLeader := kv.rf.Start(op)
-	// kv.mu.Lock()
-	// kv.Term = term
-	// kv.mu.Unlock()
-	// if !isLeader {
-	// 	reply.LeaderHint = kv.rf.LeaderId()
-	// 	// DPrintf("kv[%v] is not leader, should contact with kv[%v], reply %v", kv.me, reply.LeaderHint, reply.ServerId)
-	// 	return
-	// }
-	// DPrintf("kv[%v] is leader, handle with request key %v value %v command %v CommandId %v from client[%v]", kv.me, args.Key, args.Value, args.Command, args.SequenceNum, args.ClientId)
-	// for !kv.killed() && kv.rf.IsLeader() {
-	// 	kv.mu.Lock()
-	// 	DPrintf("kv[%v] handle request client %v commandId %v get lock", kv.me, args.ClientId, args.SequenceNum)
-	// 	if kv.done[args.ClientId].k == args.SequenceNum {
-	// 		reply.Response = kv.done[args.ClientId].Response
-	// 		kv.mu.Unlock()
-	// 		reply.LeaderHint = kv.me
-	// 		reply.Status = 1
-	// 		DPrintf("kv[%v] CommandId %v return key %v value %v to client[%v]", kv.me, args.SequenceNum, args.Key, reply.Response, args.ClientId)
-	// 		return
-	// 	} else if kv.done[args.ClientId].k < args.SequenceNum{
-	// 		kv.mu.Unlock()
-	// 		time.Sleep(2 * time.Millisecond) // 等待
-	// 	}else{
-	// 		kv.mu.Unlock()
-	// 		return
-	// 	}
-	// }
-	// reply.LeaderHint = -1
-
-	// clientId := args.ClientId
-	// seq := args.SequenceNum
-	// if _,ok := kv.done[clientId];!ok{
-	// 	kv.done[clientId] = 0
-	// }
-	// if kv.done[clientId] >= seq{
-
-	// }
+	go func() {
+		kv.removeChan(index, term)
+	}()
 }
 
 //
@@ -228,9 +151,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.me = me
 	kv.maxraftstate = maxraftstate
 	kv.data = map[string]string{}
-	kv.done = map[int64]lastOp{}
-	kv.notify = map[int]chan not{}
-	kv.lastApply = 0
+	kv.done = map[int64]int{}
+	kv.notify = map[int64]chan string{}
+	kv.lastApplied = 0
 	// You may need initialization code here.
 
 	kv.applyCh = make(chan raft.ApplyMsg)
@@ -241,72 +164,81 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 }
 
 func (kv *KVServer) Apply() {
-
 	for !kv.killed() {
-		msg := <-kv.applyCh
-		if msg.CommandValid {
-			kv.mu.Lock()
-			if msg.CommandIndex <= kv.lastApply {
-				kv.mu.Unlock()
-				continue
-			}
-			kv.lastApply = msg.CommandIndex
-			command := msg.Command
-			op, _ := command.(Op)
-			var res = ""
-			DPrintf("kv[%v] got msg index %v term %v client %v commandId %v command %v key %v value %v", kv.me, msg.CommandIndex, msg.CommandTerm, op.ClientId, op.Seq,op.Command, op.Key, op.Value)
-			if op.Command != 0 && !kv.Dup(op.ClientId, op.Seq) {
-				if op.Command == 1 {
-					kv.data[op.Key] = op.Value
-				} else {
-					kv.data[op.Key] += op.Value
+		select {
+		case msg := <-kv.applyCh:
+			if msg.CommandValid {
+				kv.mu.Lock()
+				if msg.CommandIndex <= kv.lastApplied {
+					kv.mu.Unlock()
+					continue
 				}
-				kv.done[op.ClientId] = lastOp{op.Seq, res}
-				DPrintf("kv[%v] done client[%v] commandId %v command %v now key %v value is %v ", kv.me, op.ClientId, op.Seq, op.Command, op.Key, kv.data[op.Key])
-			}
-			if op.Command == 0 {
-				res = kv.data[op.Key]
-				DPrintf("kv[%v] done client[%v] commandId %v command %v now key %v value is %v ", kv.me, op.ClientId, op.Seq, op.Command, op.Key, kv.data[op.Key])
-			}
-			if currentTerm, isleader := kv.rf.GetState(); isleader && currentTerm == msg.CommandTerm { //保证读请求还是当前leader处理
-				ch, ok := kv.notify[msg.CommandIndex]
-				if ok {
-					select {
-					case ch <- not{res: res, term: msg.CommandTerm}:
-					case <-time.After(1 * time.Millisecond):
+				command := msg.Command
+				op, _ := command.(Op)
+				var res = ""
+				if op.OpType != GET && !kv.Dup(op.ClientId, op.Seq) {
+					if op.OpType == PUT {
+						kv.data[op.Key] = op.Value
+					} else {
+						kv.data[op.Key] += op.Value
 					}
+					kv.done[op.ClientId] = op.Seq
 				}
-				// ch <- res
-				
+				if op.OpType == GET {
+					res = kv.data[op.Key]
+				}
+				if currentTerm, isleader := kv.rf.GetState(); isleader && currentTerm == msg.CommandTerm { //保证读请求还是当前leader处理
+					go func(index, term int) {
+						kv.mu.RLock()
+						defer kv.mu.RUnlock()
+						ch, ok := kv.getChan(index, term)
+						if ok {
+							select {
+							case ch <- res:
+							case <-time.After(3 * time.Millisecond):
+							}
+						}
+						// select
+					}(msg.CommandIndex, msg.CommandTerm)
+				}
+				kv.lastApplied = msg.CommandIndex
+				kv.Snapshot()
+				kv.mu.Unlock()
+			} else if msg.SnapshotValid {
+				kv.mu.Lock()
+				if !kv.rf.CondInstallSnapshot(msg.SnapshotTerm, msg.SnapshotIndex, msg.Snapshot) {
+					kv.mu.Unlock()
+					continue
+				}
+				r := bytes.NewBuffer(msg.Snapshot)
+				d := labgob.NewDecoder(r)
+				var data map[string]string
+				var done map[int64]int
+				var lastApplied int
+				if d.Decode(&data) != nil ||
+					d.Decode(&lastApplied) != nil || d.Decode(&done) != nil {
+					DPrintf("kv[%v] decode err", kv.me)
+				} else {
+					kv.data = data
+					kv.lastApplied = lastApplied
+					kv.done = done
+				}
+				kv.mu.Unlock()
 			}
-			
-			kv.mu.Unlock()
+		case <-time.After(200 * time.Microsecond):
 		}
-
 	}
 }
 
-//
-// if op, ok := command.(Op); ok {
-// 	kv.mu.Lock()
-// 	v := kv.done[op.ClientId].k
-// 	if v+1 == op.Seq {
-// 		c := op.Command
-// 		cli := op.ClientId
-// 		var rs string = ""
-// 		if c == 1 {
-// 			kv.data[op.Key] = op.Value
-// 		} else if c == 2 {
-// 			kv.data[op.Key] += op.Value
-// 		} else {
-// 			rs = kv.data[op.Key]
-// 		}
-// 		kv.done[cli] = lastOp{
-// 			v + 1,
-// 			rs,
-// 		}
-// 		DPrintf("kv[%v] done client[%v] commandId %v command %v now key %v value is %v ", kv.me, op.ClientId, op.Seq, op.Command, op.Key, kv.data[op.Key])
-// 	}
-
-// 	kv.mu.Unlock()
-// }
+func (kv *KVServer) Snapshot() {
+	length := kv.rf.GetRaftStateSize()
+	if kv.maxraftstate != -1 && length > kv.maxraftstate/3 {
+		w := new(bytes.Buffer)
+		e := labgob.NewEncoder(w)
+		e.Encode(kv.data)
+		e.Encode(kv.lastApplied)
+		e.Encode(kv.done)
+		data := w.Bytes()
+		kv.rf.Snapshot(kv.lastApplied, data)
+	}
+}
